@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from auction import AuctionMDP
+from lp_and_ama import CVXPY_AVAILABLE
 import mdp_lp
 import zeroorder
 
@@ -117,6 +118,10 @@ def run_reglp(n: int, m: int, dist: str) -> dict:
 
 
 def run_job(dist: str, method: str, n: int, m: int) -> None:
+    if method == "zeroorder" and not CVXPY_AVAILABLE:
+        write_status("SKIP", dist, method, n, m, "cvxpy_unavailable")
+        return
+
     write_status("START", dist, method, n, m)
     CURRENT_JOB_FILE.write_text(
         f"dist={dist} method={method} n={n} m={m} started_at={utc_now()}\n",

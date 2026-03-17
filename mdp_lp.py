@@ -11,13 +11,7 @@ import torch
 from lp_and_ama import (
     AMAParams,
     MDPLinearProgram,
-    UnregMDP,
     asw,
-    calcmakespan,
-    expectedmakespan,
-    expectedperformance,
-    expectedrevenue,
-    evalwithoutreg,
     dasw_dx,
     dsw_dx,
     sw,
@@ -41,10 +35,6 @@ def _objective_coeffs(lp: MDPLinearProgram, types: Any, ama: AMAParams) -> np.nd
                 ama.boosts[state_idx, action_idx]
             )
     return coeffs
-
-
-def _status_ok(status: str) -> bool:
-    return status in {"optimal", "optimal_inaccurate"}
 
 
 def _reward_matrix(lp: MDPLinearProgram, types: Any) -> np.ndarray:
@@ -212,8 +202,10 @@ class DifferentiableMDPLinearProgram:
         return grad_coeff.reshape(self.num_states, self.num_actions)
 
 
-def evalwithoutreg_lp(auctionlp: UnregMDP, types: Any, ama: AMAParams) -> np.ndarray:
-    return evalwithoutreg(auctionlp, types, ama).x
+def _mean_and_std(values: list[float]) -> tuple[float, float]:
+    mean = float(np.mean(values))
+    std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+    return mean, std
 
 
 def _calcrevenue_diff(
@@ -247,6 +239,18 @@ def _expectedrevenue_diff(
     return float(np.mean(revenues))
 
 
+def _expectedrevenue_diff_stats(
+    lp: MDPLinearProgram,
+    diff_lp: DifferentiableMDPLinearProgram,
+    ama: AMAParams,
+    num_samples: int,
+    alpha: float,
+) -> tuple[float, float]:
+    samples = lp.mdp.sampletypes(num_samples)
+    revenues = [_calcrevenue_diff(lp, diff_lp, types, ama, alpha) for types in samples]
+    return _mean_and_std(revenues)
+
+
 def _calcmakespan_diff(
     lp: MDPLinearProgram,
     diff_lp: DifferentiableMDPLinearProgram,
@@ -277,6 +281,21 @@ def _expectedmakespan_diff(
     samples = lp.mdp.sampletypes(num_samples)
     makespans = [_calcmakespan_diff(lp, diff_lp, types, ama, alpha) for types in samples]
     return float(np.mean(makespans))
+
+
+def _expectedperformance_diff_stats(
+    lp: MDPLinearProgram,
+    diff_lp: DifferentiableMDPLinearProgram,
+    ama: AMAParams,
+    num_samples: int,
+    alpha: float,
+) -> tuple[float, float]:
+    samples = lp.mdp.sampletypes(num_samples)
+    if hasattr(lp.mdp, "makespan_from_sa"):
+        performances = [-_calcmakespan_diff(lp, diff_lp, types, ama, alpha) for types in samples]
+    else:
+        performances = [_calcrevenue_diff(lp, diff_lp, types, ama, alpha) for types in samples]
+    return _mean_and_std(performances)
 
 
 def makespangrad(
@@ -554,10 +573,21 @@ def runtrial(
         )
     end_time = datetime.now()
 
-    vcg_revenue, vcg_std = expectedrevenue(lp, vcg_ama, num_samples=TEST_SAMPLES, alpha=0.0, require_optimal=True)
-    vcg_performance, vcg_performance_std = expectedperformance(lp, vcg_ama, num_samples=TEST_SAMPLES, alpha=0.0, require_optimal=True)
-    ama_revenue, ama_std = expectedrevenue(lp, ama, num_samples=TEST_SAMPLES, alpha=0.0, require_optimal=True)
-    ama_performance, ama_performance_std = expectedperformance(lp, ama, num_samples=TEST_SAMPLES, alpha=0.0, require_optimal=True)
+    # Keep the full reglp path independent of cvxpy by evaluating with the same
+    # regularized inner oracle used during training.
+    eval_alpha = reg_strength
+    vcg_revenue, vcg_std = _expectedrevenue_diff_stats(
+        lp, diff_lp, vcg_ama, num_samples=TEST_SAMPLES, alpha=eval_alpha
+    )
+    vcg_performance, vcg_performance_std = _expectedperformance_diff_stats(
+        lp, diff_lp, vcg_ama, num_samples=TEST_SAMPLES, alpha=eval_alpha
+    )
+    ama_revenue, ama_std = _expectedrevenue_diff_stats(
+        lp, diff_lp, ama, num_samples=TEST_SAMPLES, alpha=eval_alpha
+    )
+    ama_performance, ama_performance_std = _expectedperformance_diff_stats(
+        lp, diff_lp, ama, num_samples=TEST_SAMPLES, alpha=eval_alpha
+    )
 
     result = {
         "method": "reglp",
@@ -571,6 +601,7 @@ def runtrial(
         "training_iters": num_training_iters,
         "lr": lr,
         "reg_strength": reg_strength,
+        "eval_alpha": eval_alpha,
         "vcg_performance": vcg_performance,
         "vcg_performance_std": vcg_performance_std,
         "ama_performance": ama_performance,

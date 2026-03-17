@@ -8,16 +8,22 @@ import numpy as np
 
 try:
     import cvxpy as cp
-except ModuleNotFoundError as exc:
-    raise ImportError(
-        "lp_and_ama.py requires cvxpy in the active Python environment."
-    ) from exc
+except ModuleNotFoundError:
+    cp = None
 
 
 State = Any
 Action = Any
 TypeProfile = Any
 ArrayLike = np.ndarray
+CVXPY_AVAILABLE = cp is not None
+
+
+def _require_cvxpy() -> None:
+    if not CVXPY_AVAILABLE:
+        raise ImportError(
+            "This code path requires cvxpy in the active Python environment."
+        )
 
 
 class MDP(Protocol):
@@ -80,11 +86,15 @@ class MDPLinearProgram:
         self.action_list = list(self.mdp.action_list)
         self.gamma = float(self.mdp.gamma)
 
-        self.x = cp.Variable((self.num_states, self.num_actions), nonneg=True)
         self._transition_tensor = self._build_transition_tensor()
-        self._constraints = self._build_flow_constraints(self.x)
+        if CVXPY_AVAILABLE:
+            self.x = cp.Variable((self.num_states, self.num_actions), nonneg=True)
+            self._constraints = self._build_flow_constraints(self.x)
+        else:
+            self.x = np.zeros((self.num_states, self.num_actions), dtype=float)
+            self._constraints = []
 
-        self.last_problem: Optional[cp.Problem] = None
+        self.last_problem: Optional[Any] = None
         self.last_result: Optional[SolveResult] = None
 
     def _build_transition_tensor(self) -> ArrayLike:
@@ -98,6 +108,7 @@ class MDPLinearProgram:
         return tensor
 
     def _build_flow_constraints(self, x_var: "cp.Variable") -> list["cp.Constraint"]:
+        _require_cvxpy()
         constraints: list[cp.Constraint] = []
         for state_idx, state in enumerate(self.state_list):
             if not self.mdp.nonterminal(state):
@@ -117,6 +128,7 @@ class MDPLinearProgram:
         ama: AMAParams,
         alpha: float,
     ) -> "cp.Expression":
+        _require_cvxpy()
         coeffs = np.zeros((self.num_states, self.num_actions), dtype=float)
         for state_idx, state in enumerate(self.state_list):
             for action_idx, action in enumerate(self.action_list):
@@ -131,6 +143,7 @@ class MDPLinearProgram:
         return objective
 
     def solve(self, types: TypeProfile, ama: AMAParams, alpha: float) -> SolveResult:
+        _require_cvxpy()
         problem = cp.Problem(cp.Maximize(self.objective_expr(self.x, types, ama, alpha)), self._constraints)
         kwargs = dict(self.solver_kwargs or {})
         problem.solve(solver=self.solver, verbose=False, **kwargs)
@@ -157,11 +170,15 @@ class UnregMDP:
         self.action_list = list(self.mdp.action_list)
         self.gamma = float(self.mdp.gamma)
 
-        self.x = cp.Variable((self.num_states, self.num_actions), nonneg=True)
         self._transition_tensor = self._build_transition_tensor()
-        self._constraints = self._build_flow_constraints(self.x)
+        if CVXPY_AVAILABLE:
+            self.x = cp.Variable((self.num_states, self.num_actions), nonneg=True)
+            self._constraints = self._build_flow_constraints(self.x)
+        else:
+            self.x = np.zeros((self.num_states, self.num_actions), dtype=float)
+            self._constraints = []
 
-        self.last_problem: Optional[cp.Problem] = None
+        self.last_problem: Optional[Any] = None
         self.last_result: Optional[SolveResult] = None
 
     def _build_transition_tensor(self) -> ArrayLike:
@@ -175,6 +192,7 @@ class UnregMDP:
         return tensor
 
     def _build_flow_constraints(self, x_var: "cp.Variable") -> list["cp.Constraint"]:
+        _require_cvxpy()
         constraints: list[cp.Constraint] = []
         for state_idx, state in enumerate(self.state_list):
             if not self.mdp.nonterminal(state):
@@ -188,6 +206,7 @@ class UnregMDP:
         return constraints
 
     def solve(self, types: TypeProfile, ama: AMAParams) -> SolveResult:
+        _require_cvxpy()
         coeffs = np.zeros((self.num_states, self.num_actions), dtype=float)
         for state_idx, state in enumerate(self.state_list):
             for action_idx, action in enumerate(self.action_list):

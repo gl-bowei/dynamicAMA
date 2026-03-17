@@ -283,7 +283,7 @@ def _run_trial(module: Any, args: argparse.Namespace) -> tuple[dict[str, Any], d
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Profile reglp bottlenecks by backend.")
-    parser.add_argument("--module", default="mdp_lp", choices=["mdp_lp", "mdp_lp_torch"])
+    parser.add_argument("--module", default="mdp_lp", choices=["mdp_lp", "mdp_lp_torch", "mdp_lp_torch_batch"])
     parser.add_argument("--num-agents", type=int, default=4)
     parser.add_argument("--num-items", type=int, default=3)
     parser.add_argument("--num-samples", type=int, default=20)

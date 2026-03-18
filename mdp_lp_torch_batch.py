@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from lp_and_ama import AMAParams, MDPLinearProgram, asw, dsw_dx, sw
+import mdp_lp
 import mdp_lp_torch
 
 
@@ -87,20 +88,20 @@ class BatchedTorchDifferentiableMDPLinearProgram:
         self.num_actions = len(self.lp.mdp.action_list)
         self.num_variables = self.num_states * self.num_actions
         flow_matrix_np, rhs_np = self._build_flow_matrix()
+        self._flow_matrix_np = flow_matrix_np
+        self._rhs_np = rhs_np
         self._flow_matrix = torch.as_tensor(flow_matrix_np, dtype=self.dtype, device=self.device)
         self._flow_matrix_T = self._flow_matrix.transpose(0, 1).contiguous()
         self._rhs = torch.as_tensor(rhs_np, dtype=self.dtype, device=self.device)
         self._identity = torch.eye(self._flow_matrix.shape[0], dtype=self.dtype, device=self.device)
-        self._dual_warm_start: dict[int, torch.Tensor] = {}
+        if flow_matrix_np.size:
+            gram = flow_matrix_np.dot(flow_matrix_np.T) + LINEAR_SOLVE_EPS * np.eye(flow_matrix_np.shape[0])
+            dual_init_np = np.linalg.solve(gram, flow_matrix_np)
+        else:
+            dual_init_np = np.zeros((0, self.num_variables), dtype=float)
+        self._dual_init = torch.as_tensor(dual_init_np, dtype=self.dtype, device=self.device)
         self.last_solve_info: dict[str, Any] = {}
-        self._single_solver = mdp_lp_torch.TorchDifferentiableMDPLinearProgram(
-            self.lp,
-            alpha=self.alpha,
-            device=self.device,
-            optimizer_name="lbfgs",
-            optimizer_lr=1.0,
-            max_iters=self.max_iters,
-        )
+        self._cpu_fallback_solver = mdp_lp.DifferentiableMDPLinearProgram(self.lp, alpha=self.alpha)
 
     @staticmethod
     def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -149,11 +150,14 @@ class BatchedTorchDifferentiableMDPLinearProgram:
             device=self.device,
         )
 
-    def _initial_dual(self, batch_size: int) -> torch.Tensor:
-        warm = self._dual_warm_start.get(batch_size)
-        if warm is not None:
-            return warm.clone()
-        return torch.zeros((batch_size, self._flow_matrix.shape[0]), dtype=self.dtype, device=self.device)
+    def _initial_dual(self, coeffs_flat_batch: torch.Tensor) -> torch.Tensor:
+        if self._dual_init.numel() == 0:
+            return torch.zeros(
+                (coeffs_flat_batch.shape[0], self._flow_matrix.shape[0]),
+                dtype=self.dtype,
+                device=self.device,
+            )
+        return coeffs_flat_batch @ self._dual_init.transpose(0, 1)
 
     def _primal_from_dual(
         self, dual_batch: torch.Tensor, coeffs_flat_batch: torch.Tensor
@@ -186,15 +190,20 @@ class BatchedTorchDifferentiableMDPLinearProgram:
         )
         return x_flat, residual, objective, finite
 
+    def _residual_from_x_numpy(self, x: np.ndarray) -> float:
+        x_flat = np.asarray(x, dtype=float).reshape(-1)
+        flow = self._flow_matrix_np.dot(x_flat)
+        return float(np.max(np.abs(self._rhs_np - flow)))
+
     def solve_coeffs_batch(self, coeffs_batch: np.ndarray) -> np.ndarray:
         coeffs_flat_batch = self._coeffs_to_tensor(coeffs_batch)
         batch_size = coeffs_flat_batch.shape[0]
-        dual = self._initial_dual(batch_size)
+        dual = self._initial_dual(coeffs_flat_batch)
         best_dual = dual.clone()
         best_x_flat, best_residual, best_objective, finite = self._evaluate_candidates(dual, coeffs_flat_batch)
         best_residual = torch.where(finite, best_residual, torch.full_like(best_residual, float("inf")))
         active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-        step_lr = self.step_lr
+        step_lr = torch.full((batch_size,), self.step_lr, dtype=self.dtype, device=self.device)
         steps_taken = 0
 
         for step in range(self.max_iters):
@@ -205,63 +214,76 @@ class BatchedTorchDifferentiableMDPLinearProgram:
             grad_scale = torch.clamp(grad_inf, min=1.0)
             direction = grad / grad_scale
             grad_norm = torch.linalg.norm(grad, dim=1)
-            active = active & current_finite & (grad_norm > self.grad_tolerance)
+            active = active & current_finite & (grad_norm > self.grad_tolerance) & (best_residual > FLOW_RESIDUAL_TOL)
             if not torch.any(active):
                 steps_taken = step + 1
                 break
 
-            trial_lr = step_lr
-            accepted_any = False
+            trial_lr = step_lr.clone()
+            accepted_any = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            pending = active.clone()
             for _ in range(20):
+                if not torch.any(pending):
+                    break
                 candidate_dual = dual.clone()
-                candidate_dual[active] = dual[active] - trial_lr * direction[active]
+                candidate_dual[pending] = dual[pending] - trial_lr[pending].unsqueeze(1) * direction[pending]
                 self._clip_dual_(candidate_dual)
                 cand_x, cand_residual, cand_objective, cand_finite = self._evaluate_candidates(
                     candidate_dual, coeffs_flat_batch
                 )
-                improve = active & cand_finite & (cand_objective <= current_objective + 1e-12)
+                better = pending & cand_finite & (cand_residual < best_residual)
+                if torch.any(better):
+                    best_dual[better] = candidate_dual[better]
+                    best_x_flat[better] = cand_x[better]
+                    best_residual[better] = cand_residual[better]
+                    best_objective[better] = cand_objective[better]
+
+                improve = pending & cand_finite & (cand_objective <= current_objective + 1e-12)
                 if torch.any(improve):
                     dual[improve] = candidate_dual[improve]
-                    better = improve & (cand_residual < best_residual)
-                    if torch.any(better):
-                        best_dual[better] = candidate_dual[better]
-                        best_x_flat[better] = cand_x[better]
-                        best_residual[better] = cand_residual[better]
-                        best_objective[better] = cand_objective[better]
-                    active = active & ~(best_residual <= FLOW_RESIDUAL_TOL)
-                    accepted_any = True
-                    break
-                trial_lr *= 0.5
-                if trial_lr < 1e-8:
-                    break
-            if not accepted_any:
+                    accepted_any |= improve
+
+                rejected = pending & ~improve
+                if torch.any(rejected):
+                    trial_lr[rejected] *= 0.5
+                pending = rejected & (trial_lr >= 1e-8)
+
+            if not torch.any(accepted_any):
                 steps_taken = step + 1
                 break
-            step_lr = min(trial_lr * 1.1, self.step_lr)
+            step_lr[accepted_any] = torch.minimum(
+                trial_lr[accepted_any] * 1.1,
+                torch.full_like(trial_lr[accepted_any], self.step_lr),
+            )
+            inactive_after = active & ~accepted_any
+            if torch.any(inactive_after):
+                step_lr[inactive_after] = torch.clamp(trial_lr[inactive_after], min=1e-8, max=self.step_lr)
             steps_taken = step + 1
 
-        fallback_count = 0
+        cpu_fallback_count = 0
         bad_mask = best_residual > FLOW_RESIDUAL_TOL
         if torch.any(bad_mask):
             bad_indices = torch.nonzero(bad_mask, as_tuple=False).flatten().tolist()
             for batch_idx in bad_indices:
-                x_single = self._single_solver.solve_x(coeffs_batch[batch_idx])
-                residual_single = self._single_solver.last_solve_info.get("best_residual", float("inf"))
-                if np.isfinite(residual_single) and residual_single < float(best_residual[batch_idx].item()):
+                x_single = self._cpu_fallback_solver.solve_x(coeffs_batch[batch_idx])
+                residual_single = self._residual_from_x_numpy(x_single)
+                if np.isfinite(residual_single) and (
+                    residual_single <= FLOW_RESIDUAL_TOL
+                    or residual_single < float(best_residual[batch_idx].item())
+                ):
                     best_x_flat[batch_idx] = torch.as_tensor(
                         x_single.reshape(-1), dtype=self.dtype, device=self.device
                     )
                     best_residual[batch_idx] = residual_single
-                    fallback_count += 1
+                    cpu_fallback_count += 1
 
-        self._dual_warm_start[batch_size] = best_dual.detach().clone()
         self.last_solve_info = {
             "device": str(self.device),
             "best_residual": float(torch.max(best_residual).item()),
             "mean_residual": float(torch.mean(best_residual).item()),
             "optimizer_steps": steps_taken,
             "batch_size": batch_size,
-            "fallback_count": fallback_count,
+            "fallback_count": cpu_fallback_count,
             "bad_after_fallback": int(torch.sum(best_residual > FLOW_RESIDUAL_TOL).item()),
         }
         return best_x_flat.reshape(batch_size, self.num_states, self.num_actions).detach().cpu().numpy()

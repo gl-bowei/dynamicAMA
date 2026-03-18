@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from lp_and_ama import AMAParams, MDPLinearProgram, asw, dsw_dx, sw
+import mdp_lp_torch
 
 
 TEST_SAMPLES = 10000
@@ -92,6 +93,14 @@ class BatchedTorchDifferentiableMDPLinearProgram:
         self._identity = torch.eye(self._flow_matrix.shape[0], dtype=self.dtype, device=self.device)
         self._dual_warm_start: dict[int, torch.Tensor] = {}
         self.last_solve_info: dict[str, Any] = {}
+        self._single_solver = mdp_lp_torch.TorchDifferentiableMDPLinearProgram(
+            self.lp,
+            alpha=self.alpha,
+            device=self.device,
+            optimizer_name="lbfgs",
+            optimizer_lr=1.0,
+            max_iters=self.max_iters,
+        )
 
     @staticmethod
     def _resolve_device(device: str | torch.device | None) -> torch.device:
@@ -231,6 +240,20 @@ class BatchedTorchDifferentiableMDPLinearProgram:
             step_lr = min(trial_lr * 1.1, self.step_lr)
             steps_taken = step + 1
 
+        fallback_count = 0
+        bad_mask = best_residual > FLOW_RESIDUAL_TOL
+        if torch.any(bad_mask):
+            bad_indices = torch.nonzero(bad_mask, as_tuple=False).flatten().tolist()
+            for batch_idx in bad_indices:
+                x_single = self._single_solver.solve_x(coeffs_batch[batch_idx])
+                residual_single = self._single_solver.last_solve_info.get("best_residual", float("inf"))
+                if np.isfinite(residual_single) and residual_single < float(best_residual[batch_idx].item()):
+                    best_x_flat[batch_idx] = torch.as_tensor(
+                        x_single.reshape(-1), dtype=self.dtype, device=self.device
+                    )
+                    best_residual[batch_idx] = residual_single
+                    fallback_count += 1
+
         self._dual_warm_start[batch_size] = best_dual.detach().clone()
         self.last_solve_info = {
             "device": str(self.device),
@@ -238,6 +261,8 @@ class BatchedTorchDifferentiableMDPLinearProgram:
             "mean_residual": float(torch.mean(best_residual).item()),
             "optimizer_steps": steps_taken,
             "batch_size": batch_size,
+            "fallback_count": fallback_count,
+            "bad_after_fallback": int(torch.sum(best_residual > FLOW_RESIDUAL_TOL).item()),
         }
         return best_x_flat.reshape(batch_size, self.num_states, self.num_actions).detach().cpu().numpy()
 
@@ -503,8 +528,11 @@ def runtrial(
         "ama_std": ama_std,
         "runtime": end_time - start_time,
         "last_solver_residual": diff_lp.last_solve_info.get("best_residual"),
+        "last_solver_mean_residual": diff_lp.last_solve_info.get("mean_residual"),
         "last_solver_steps": diff_lp.last_solve_info.get("optimizer_steps"),
         "last_batch_size": diff_lp.last_solve_info.get("batch_size"),
+        "last_fallback_count": diff_lp.last_solve_info.get("fallback_count"),
+        "last_bad_after_fallback": diff_lp.last_solve_info.get("bad_after_fallback"),
     }
     return result, {"ama": ama, "vals": vals}
 
